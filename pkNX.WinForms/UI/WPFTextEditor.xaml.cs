@@ -280,6 +280,101 @@ public partial class WPFTextEditor
             Entries[i] = Entries[i] with { Line = i };
     }
 
+    private void PopulateEntriesFromIndex(int index)
+    {
+        var file = new TextFile(TextFiles[index].ReadAllBytes(), Config);
+        var tbl = new AHTB(TableFiles[index].Open());
+        var lines = file.Lines;
+        var flags = file.Flags;
+
+        for (int i = 0; i < tbl.Count; ++i)
+        {
+            var label = tbl.Entries[i];
+            bool isLast = i == tbl.Count - 1;
+            var flag = isLast ? (ushort)0 : flags[i];
+            var text = isLast ? "" : lines[i];
+            Entries.Add(new TextEditorEntry(i, label.Name, label.Hash, flag, text, isLast));
+        }
+    }
+
+    /// <summary>
+    /// Exports a game file directly to a txt file without touching <see cref="Entries"/>.
+    /// </summary>
+    private void ExportFileToText(int index, string path, bool replaceNewline)
+    {
+        var file = new TextFile(TextFiles[index].ReadAllBytes(), Config);
+        var tbl = new AHTB(TableFiles[index].Open());
+        var lines = file.Lines;
+        var flags = file.Flags;
+
+        using var ms = new MemoryStream();
+        ms.Write([0xFF, 0xFE], 0, 2);
+        using (TextWriter tw = new StreamWriter(ms, new UnicodeEncoding()))
+        {
+            for (int i = 0; i < tbl.Count; ++i)
+            {
+                var label = tbl.Entries[i];
+                bool isLast = i == tbl.Count - 1;
+                var textString = isLast ? "" : lines[i];
+                var flag = isLast ? (ushort)0 : flags[i];
+                if (!isLast && replaceNewline)
+                    textString = textString.Replace("\\n", "\n");
+                tw.WriteLine($"|{label.Name}|0x{label.Hash:X16}|0x{flag:X4}|{textString}");
+            }
+        }
+        File.WriteAllBytes(path, ms.ToArray());
+    }
+
+    /// <summary>
+    /// Parses a txt file and saves it directly to the game file at <paramref name="index"/>
+    /// without touching <see cref="Entries"/>.
+    /// </summary>
+    private bool ImportFileFromText(int index, string txtPath)
+    {
+        string[] fileText = File.ReadAllLines(txtPath, Encoding.Unicode);
+        List<TextEditorEntry> entries = [];
+
+        for (int i = 0; i < fileText.Length; i++)
+        {
+            ReadOnlySpan<char> line = fileText[i].AsSpan();
+
+            if (!line.StartsWith("|"))
+            {
+                if (entries.Count == 0)
+                    continue;
+                var lastEntry = entries[^1];
+                entries[^1] = lastEntry with { Text = lastEntry.Text + "\\n" + line.ToString() };
+                continue;
+            }
+
+            line = line[1..];
+
+            int sep = line.IndexOf('|');
+            if (sep == -1) { WinFormsUtil.Error($"Invalid Line @ {i} in '{Path.GetFileName(txtPath)}', expected '|', but was not found near '{line}'"); return false; }
+            string variable = line[..sep].ToString();
+            line = line[(sep + 1)..];
+
+            sep = line.IndexOf('|');
+            if (sep == -1) { WinFormsUtil.Error($"Invalid Line @ {i} in '{Path.GetFileName(txtPath)}', expected '|', but was not found near '{line}'"); return false; }
+            if (!ulong.TryParse(line[2..sep], NumberStyles.HexNumber, null, out var hash))
+                hash = FnvHash.HashFnv1a_64(variable);
+            line = line[(sep + 1)..];
+
+            sep = line.IndexOf('|');
+            if (sep == -1) { WinFormsUtil.Error($"Invalid Line @ {i} in '{Path.GetFileName(txtPath)}', expected '|', but was not found near '{line}'"); return false; }
+            ushort.TryParse(line[2..sep], NumberStyles.HexNumber, null, out var flags);
+            line = line[(sep + 1)..];
+
+            entries.Add(new TextEditorEntry(entries.Count, variable, hash, flags, line.ToString()));
+        }
+
+        var textBytes = TextFile.GetBytes(entries.SkipLast(1).Select(x => x.Text), entries.SkipLast(1).Select(x => x.Flags), Config);
+        TextFiles[index].WriteAllBytes(textBytes);
+        AHTB tbl = new(entries.ToDictionary(x => x.Hash, y => y.Variable));
+        TableFiles[index].WriteAllBytes(tbl);
+        return true;
+    }
+
     public void LoadSelectedFile()
     {
         LoadedFileIndex = CB_Entry.SelectedIndex;
@@ -426,17 +521,60 @@ public partial class WPFTextEditor
         var result = WinFormsUtil.Prompt(MessageBoxButton.YesNo, "Would you like to unescape newline characters?");
         bool newline = result == MessageBoxResult.Yes;
 
-        foreach (var fileName in FileNames)
+        for (int i = 0; i < FileNames.Count; i++)
         {
-            string path = Path.Combine(dumpFolder.SelectedPath, fileName + ".txt");
-            ExportTextFile(path, newline);
+            string path = Path.Combine(dumpFolder.SelectedPath, FileNames[i] + ".txt");
+            if (i == LoadedFileIndex)
+                ExportTextFile(path, newline); // Use current Entries to include any unsaved changes
+            else
+                ExportFileToText(i, path, newline);
         }
 
         System.Media.SystemSounds.Asterisk.Play();
     }
 
+    private void BatchImport()
+    {
+        using var importFolder = new System.Windows.Forms.FolderBrowserDialog();
+        importFolder.Description = "Select import folder";
+        importFolder.UseDescriptionForTitle = true;
+
+        if (importFolder.ShowDialog() != System.Windows.Forms.DialogResult.OK)
+            return;
+
+        int imported = 0;
+        int skipped = 0;
+
+        for (int i = 0; i < FileNames.Count; i++)
+        {
+            string txtPath = Path.Combine(importFolder.SelectedPath, FileNames[i] + ".txt");
+            if (!File.Exists(txtPath))
+            {
+                skipped++;
+                continue;
+            }
+
+            if (ImportFileFromText(i, txtPath))
+                imported++;
+        }
+
+        // Reload the currently displayed file to reflect any changes just imported
+        Entries.Clear();
+        PopulateEntriesFromIndex(LoadedFileIndex);
+        Modified = false;
+
+        WinFormsUtil.Alert($"Batch import complete.\nImported: {imported}, Skipped (no matching file): {skipped}");
+        System.Media.SystemSounds.Asterisk.Play();
+    }
+
     private void B_Import_Click(object sender, RoutedEventArgs e)
     {
+        if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift))
+        {
+            BatchImport();
+            return;
+        }
+
         using var dump = new System.Windows.Forms.OpenFileDialog();
         dump.Filter = @"Text File|*.txt";
         dump.FileName = FileNames[LoadedFileIndex] + ".txt";
